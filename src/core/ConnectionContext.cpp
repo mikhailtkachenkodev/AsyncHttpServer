@@ -10,6 +10,7 @@ ConnectionContext::ConnectionContext(SOCKET socket, bool isHttps)
     , m_isHttps(isHttps)
     , m_state(ConnectionState::Accepting)
     , m_bytesSent(0)
+    , m_sendBufferSize(0)
     , m_pendingOperations(0)
     , m_keepAlive(true)
     , m_lastActivity(std::chrono::steady_clock::now()) {
@@ -22,6 +23,11 @@ ConnectionContext::~ConnectionContext() {
 void ConnectionContext::AppendToReceiveBuffer(const char* data, size_t length) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_receiveBuffer.append(data, length);
+}
+
+std::string ConnectionContext::GetReceiveBuffer() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_receiveBuffer;
 }
 
 void ConnectionContext::ClearReceiveBuffer() {
@@ -41,29 +47,53 @@ void ConnectionContext::ConsumeReceiveBuffer(size_t bytes) {
 void ConnectionContext::SetSendBuffer(const std::string& data) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_sendBuffer = data;
-    m_bytesSent = 0;
+    m_sendBufferSize = m_sendBuffer.size();
+    m_bytesSent.store(0, std::memory_order_release);
 }
 
 void ConnectionContext::SetSendBuffer(std::string&& data) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_sendBuffer = std::move(data);
-    m_bytesSent = 0;
+    m_sendBufferSize = m_sendBuffer.size();
+    m_bytesSent.store(0, std::memory_order_release);
+}
+
+std::string ConnectionContext::GetSendBuffer() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_sendBuffer;
+}
+
+bool ConnectionContext::IsSendComplete() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_bytesSent.load(std::memory_order_acquire) >= m_sendBufferSize;
+}
+
+size_t ConnectionContext::GetRemainingBytes() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    size_t sent = m_bytesSent.load(std::memory_order_acquire);
+    if (sent >= m_sendBufferSize) {
+        return 0;
+    }
+    return m_sendBufferSize - sent;
 }
 
 void ConnectionContext::SetTlsConnection(std::unique_ptr<security::TlsConnection> tls) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_tlsConnection = std::move(tls);
 }
 
 void ConnectionContext::UpdateLastActivity() {
-    m_lastActivity = std::chrono::steady_clock::now();
+    m_lastActivity.store(std::chrono::steady_clock::now(), std::memory_order_release);
 }
 
 void ConnectionContext::Close() {
-    if (m_socket != INVALID_SOCKET) {
-        shutdown(m_socket, SD_BOTH);
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
-        m_state = ConnectionState::Closed;
+    std::lock_guard<std::mutex> lock(m_closeMutex);
+
+    SOCKET sock = m_socket.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+    if (sock != INVALID_SOCKET) {
+        shutdown(sock, SD_BOTH);
+        closesocket(sock);
+        m_state.store(ConnectionState::Closed, std::memory_order_release);
     }
 }
 

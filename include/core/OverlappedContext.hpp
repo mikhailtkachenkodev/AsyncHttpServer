@@ -22,19 +22,21 @@ enum class IoOperation {
 };
 
 class ConnectionContext;
+using ConnectionContextPtr = std::shared_ptr<ConnectionContext>;
 
 struct OverlappedContext : public OVERLAPPED {
     IoOperation operation;
     WSABUF wsaBuf;
     std::array<char, BUFFER_SIZE> buffer;
-    ConnectionContext* connection;
+    ConnectionContextPtr connection;  // Use shared_ptr to prevent use-after-free
     SOCKET acceptSocket;
+    bool isHttpsAccept;  // Flag for accept operations
 
     OverlappedContext();
     void Reset();
     void PrepareForReceive();
     void PrepareForSend(const char* data, size_t length);
-    void PrepareForAccept(SOCKET socket);
+    void PrepareForAccept(SOCKET socket, bool isHttps);
 };
 
 using OverlappedContextPtr = std::unique_ptr<OverlappedContext>;

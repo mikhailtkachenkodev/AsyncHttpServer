@@ -7,7 +7,8 @@ namespace core {
 OverlappedContext::OverlappedContext()
     : operation(IoOperation::Receive)
     , connection(nullptr)
-    , acceptSocket(INVALID_SOCKET) {
+    , acceptSocket(INVALID_SOCKET)
+    , isHttpsAccept(false) {
     Reset();
 }
 
@@ -41,10 +42,12 @@ void OverlappedContext::PrepareForSend(const char* data, size_t length) {
     wsaBuf.len = static_cast<ULONG>(copyLen);
 }
 
-void OverlappedContext::PrepareForAccept(SOCKET socket) {
+void OverlappedContext::PrepareForAccept(SOCKET socket, bool isHttps) {
     Reset();
     operation = IoOperation::Accept;
     acceptSocket = socket;
+    isHttpsAccept = isHttps;
+    connection = nullptr;  // Clear any previous connection
     wsaBuf.buf = buffer.data();
     wsaBuf.len = static_cast<ULONG>(buffer.size());
 }

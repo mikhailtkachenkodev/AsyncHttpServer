@@ -78,21 +78,20 @@ private:
     void HandleCompletion(const core::CompletionResult& result);
 
     void HandleAccept(core::OverlappedContext* context, DWORD bytesTransferred);
-    void HandleReceive(core::OverlappedContext* context, DWORD bytesTransferred);
-    void HandleSend(core::OverlappedContext* context, DWORD bytesTransferred);
-    void HandleDisconnect(core::ConnectionContext* connection);
+    void HandleReceive(const core::ConnectionContextPtr& connection, DWORD bytesTransferred);
+    void HandleSend(const core::ConnectionContextPtr& connection, DWORD bytesTransferred);
+    void HandleDisconnect(const core::ConnectionContextPtr& connection);
 
-    void HandleTlsHandshake(core::ConnectionContext* connection, const char* data, size_t length);
-    void ProcessTlsDecryptedData(core::ConnectionContext* connection);
+    void HandleTlsHandshake(const core::ConnectionContextPtr& connection, const char* data, size_t length);
+    void ProcessTlsDecryptedData(const core::ConnectionContextPtr& connection);
 
-    void ProcessRequest(core::ConnectionContext* connection);
-    void SendResponse(core::ConnectionContext* connection, const http::HttpResponse& response);
+    void ProcessRequest(const core::ConnectionContextPtr& connection);
+    void SendResponse(const core::ConnectionContextPtr& connection, const http::HttpResponse& response);
 
-    void PostReceive(core::ConnectionContext* connection);
-    void PostSend(core::ConnectionContext* connection);
+    void PostReceive(const core::ConnectionContextPtr& connection);
+    void PostSend(const core::ConnectionContextPtr& connection);
 
     core::ConnectionContextPtr CreateConnection(SOCKET socket, bool isHttps);
-    void CloseConnection(core::ConnectionContext* connection);
     void RemoveConnection(SOCKET socket);
 
     void WaitForConnections(std::chrono::seconds timeout);

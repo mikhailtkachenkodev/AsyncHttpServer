@@ -182,7 +182,17 @@ SOCKET HttpServer::CreateListenSocket(uint16_t port, bool isHttps) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, m_config.bindAddress.c_str(), &addr.sin_addr);
+
+    // Fix: Check inet_pton return value
+    int inetResult = inet_pton(AF_INET, m_config.bindAddress.c_str(), &addr.sin_addr);
+    if (inetResult != 1) {
+        closesocket(sock);
+        if (inetResult == 0) {
+            throw core::WinsockException("Invalid bind address format: " + m_config.bindAddress, 0);
+        } else {
+            throw core::WinsockException("Failed to parse bind address", WSAGetLastError());
+        }
+    }
 
     if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
         int error = WSAGetLastError();
@@ -219,8 +229,20 @@ void HttpServer::PostAccept(SOCKET listenSocket, bool isHttps) {
     }
 
     auto context = std::make_unique<core::OverlappedContext>();
-    context->PrepareForAccept(acceptSocket);
-    context->connection = reinterpret_cast<core::ConnectionContext*>(isHttps ? 1 : 0);
+    context->PrepareForAccept(acceptSocket, isHttps);
+
+    // Fix: Add context to tracking BEFORE calling AcceptEx to prevent race
+    {
+        std::lock_guard<std::mutex> lock(m_acceptMutex);
+        m_acceptContexts.push_back(std::move(context));
+    }
+
+    // Get raw pointer for AcceptEx call
+    core::OverlappedContext* rawContext = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_acceptMutex);
+        rawContext = m_acceptContexts.back().get();
+    }
 
     DWORD bytesReceived = 0;
     LPFN_ACCEPTEX acceptEx = core::WinsockInit::GetAcceptEx();
@@ -228,23 +250,31 @@ void HttpServer::PostAccept(SOCKET listenSocket, bool isHttps) {
     BOOL result = acceptEx(
         listenSocket,
         acceptSocket,
-        context->buffer.data(),
+        rawContext->buffer.data(),
         0,
         sizeof(sockaddr_in) + 16,
         sizeof(sockaddr_in) + 16,
         &bytesReceived,
-        context.get()
+        rawContext
     );
 
     if (!result && WSAGetLastError() != ERROR_IO_PENDING) {
         int error = WSAGetLastError();
         closesocket(acceptSocket);
+
+        // Remove the context we just added since AcceptEx failed
+        {
+            std::lock_guard<std::mutex> lock(m_acceptMutex);
+            auto it = std::find_if(m_acceptContexts.begin(), m_acceptContexts.end(),
+                [rawContext](const auto& ptr) { return ptr.get() == rawContext; });
+            if (it != m_acceptContexts.end()) {
+                m_acceptContexts.erase(it);
+            }
+        }
+
         utils::Logger::Error("AcceptEx failed: " + utils::ErrorHandler::GetWsaErrorMessage(error));
         return;
     }
-
-    std::lock_guard<std::mutex> lock(m_acceptMutex);
-    m_acceptContexts.push_back(std::move(context));
 }
 
 void HttpServer::HandleCompletion(const core::CompletionResult& result) {
@@ -258,28 +288,51 @@ void HttpServer::HandleCompletion(const core::CompletionResult& result) {
     if (context->operation == core::IoOperation::Accept) {
         if (result.success) {
             HandleAccept(context, result.bytesTransferred);
+        } else {
+            // Clean up failed accept
+            std::lock_guard<std::mutex> lock(m_acceptMutex);
+            auto it = std::find_if(m_acceptContexts.begin(), m_acceptContexts.end(),
+                [context](const auto& ptr) { return ptr.get() == context; });
+            if (it != m_acceptContexts.end()) {
+                closesocket(context->acceptSocket);
+                m_acceptContexts.erase(it);
+            }
         }
         return;
     }
+
+    // For non-accept operations, get the shared_ptr to keep connection alive
+    core::ConnectionContextPtr connection = context->connection;
+    core::IoOperation operation = context->operation;
+
+    // Copy buffer data to connection before deleting context (for receive operations)
+    if (operation == core::IoOperation::Receive && result.success && result.bytesTransferred > 0) {
+        connection->AppendToReceiveBuffer(context->buffer.data(), result.bytesTransferred);
+    }
+
+    // Clean up the overlapped context
+    delete context;
+
+    if (!connection) {
+        return;
+    }
+
+    connection->DecrementPendingOperations();
 
     if (!result.success || result.bytesTransferred == 0) {
-        if (context->connection) {
-            HandleDisconnect(context->connection);
-        }
+        HandleDisconnect(connection);
         return;
     }
 
-    switch (context->operation) {
+    switch (operation) {
         case core::IoOperation::Receive:
-            HandleReceive(context, result.bytesTransferred);
+            HandleReceive(connection, result.bytesTransferred);
             break;
         case core::IoOperation::Send:
-            HandleSend(context, result.bytesTransferred);
+            HandleSend(connection, result.bytesTransferred);
             break;
         case core::IoOperation::Disconnect:
-            if (context->connection) {
-                HandleDisconnect(context->connection);
-            }
+            HandleDisconnect(connection);
             break;
         default:
             break;
@@ -288,8 +341,9 @@ void HttpServer::HandleCompletion(const core::CompletionResult& result) {
 
 void HttpServer::HandleAccept(core::OverlappedContext* context, DWORD /*bytesTransferred*/) {
     SOCKET acceptSocket = context->acceptSocket;
-    bool isHttps = context->connection != nullptr;
+    bool isHttps = context->isHttpsAccept;
 
+    // Remove the context from tracking
     {
         std::lock_guard<std::mutex> lock(m_acceptMutex);
         auto it = std::find_if(m_acceptContexts.begin(), m_acceptContexts.end(),
@@ -335,23 +389,22 @@ void HttpServer::HandleAccept(core::OverlappedContext* context, DWORD /*bytesTra
 
     connection->SetState(core::ConnectionState::Reading);
 
-    PostReceive(connection.get());
+    PostReceive(connection);
 }
 
-void HttpServer::HandleReceive(core::OverlappedContext* context, DWORD bytesTransferred) {
-    auto* connection = context->connection;
+void HttpServer::HandleReceive(const core::ConnectionContextPtr& connection, DWORD bytesTransferred) {
     if (!connection) {
         return;
     }
 
     connection->UpdateLastActivity();
 
-    connection->AppendToReceiveBuffer(context->buffer.data(), bytesTransferred);
+    // Buffer data was already copied to connection in HandleCompletion
 
     if (connection->IsHttps()) {
         auto* tls = connection->GetTlsConnection();
         if (tls && !tls->IsHandshakeComplete()) {
-            const auto& recvBuf = connection->GetReceiveBuffer();
+            std::string recvBuf = connection->GetReceiveBuffer();
             HandleTlsHandshake(connection, recvBuf.data(), recvBuf.size());
             return;
         } else if (tls) {
@@ -363,8 +416,7 @@ void HttpServer::HandleReceive(core::OverlappedContext* context, DWORD bytesTran
     ProcessRequest(connection);
 }
 
-void HttpServer::HandleSend(core::OverlappedContext* context, DWORD bytesTransferred) {
-    auto* connection = context->connection;
+void HttpServer::HandleSend(const core::ConnectionContextPtr& connection, DWORD bytesTransferred) {
     if (!connection) {
         return;
     }
@@ -396,17 +448,17 @@ void HttpServer::HandleSend(core::OverlappedContext* context, DWORD bytesTransfe
     }
 }
 
-void HttpServer::HandleDisconnect(core::ConnectionContext* connection) {
+void HttpServer::HandleDisconnect(const core::ConnectionContextPtr& connection) {
     if (!connection) {
         return;
     }
 
     SOCKET socket = connection->GetSocket();
-    CloseConnection(connection);
+    connection->Close();
     RemoveConnection(socket);
 }
 
-void HttpServer::HandleTlsHandshake(core::ConnectionContext* connection, const char* data, size_t length) {
+void HttpServer::HandleTlsHandshake(const core::ConnectionContextPtr& connection, const char* data, size_t length) {
     auto* tls = connection->GetTlsConnection();
     if (!tls) {
         HandleDisconnect(connection);
@@ -443,16 +495,14 @@ void HttpServer::HandleTlsHandshake(core::ConnectionContext* connection, const c
     }
 }
 
-void HttpServer::ProcessTlsDecryptedData(core::ConnectionContext* connection) {
+void HttpServer::ProcessTlsDecryptedData(const core::ConnectionContextPtr& connection) {
     auto* tls = connection->GetTlsConnection();
     if (!tls) {
         return;
     }
 
-    auto decrypted = tls->Decrypt(
-        connection->GetReceiveBuffer().data(),
-        connection->GetReceiveBuffer().size()
-    );
+    std::string recvBuf = connection->GetReceiveBuffer();
+    auto decrypted = tls->Decrypt(recvBuf.data(), recvBuf.size());
 
     if (decrypted.empty()) {
         PostReceive(connection);
@@ -464,9 +514,10 @@ void HttpServer::ProcessTlsDecryptedData(core::ConnectionContext* connection) {
     ProcessRequest(connection);
 }
 
-void HttpServer::ProcessRequest(core::ConnectionContext* connection) {
+void HttpServer::ProcessRequest(const core::ConnectionContextPtr& connection) {
     http::HttpParser parser;
-    auto result = parser.Feed(connection->GetReceiveBuffer());
+    std::string recvBuf = connection->GetReceiveBuffer();
+    auto result = parser.Feed(recvBuf);
 
     switch (result) {
         case http::ParseResult::Complete: {
@@ -499,7 +550,7 @@ void HttpServer::ProcessRequest(core::ConnectionContext* connection) {
     }
 }
 
-void HttpServer::SendResponse(core::ConnectionContext* connection, const http::HttpResponse& response) {
+void HttpServer::SendResponse(const core::ConnectionContextPtr& connection, const http::HttpResponse& response) {
     std::string data = response.Serialize();
 
     if (connection->IsHttps()) {
@@ -518,10 +569,10 @@ void HttpServer::SendResponse(core::ConnectionContext* connection, const http::H
     PostSend(connection);
 }
 
-void HttpServer::PostReceive(core::ConnectionContext* connection) {
+void HttpServer::PostReceive(const core::ConnectionContextPtr& connection) {
     auto context = core::CreateOverlappedContext();
     context->PrepareForReceive();
-    context->connection = connection;
+    context->connection = connection;  // Store shared_ptr to prevent use-after-free
 
     connection->IncrementPendingOperations();
 
@@ -545,17 +596,21 @@ void HttpServer::PostReceive(core::ConnectionContext* connection) {
         return;
     }
 
-    context.release();
+    context.release();  // IOCP now owns the context
 }
 
-void HttpServer::PostSend(core::ConnectionContext* connection) {
-    const std::string& buffer = connection->GetSendBuffer();
+void HttpServer::PostSend(const core::ConnectionContextPtr& connection) {
+    std::string buffer = connection->GetSendBuffer();
     size_t offset = connection->GetBytesSent();
     size_t remaining = connection->GetRemainingBytes();
 
+    if (remaining == 0) {
+        return;  // Nothing to send
+    }
+
     auto context = core::CreateOverlappedContext();
     context->PrepareForSend(buffer.data() + offset, remaining);
-    context->connection = connection;
+    context->connection = connection;  // Store shared_ptr to prevent use-after-free
 
     connection->IncrementPendingOperations();
 
@@ -578,7 +633,7 @@ void HttpServer::PostSend(core::ConnectionContext* connection) {
         return;
     }
 
-    context.release();
+    context.release();  // IOCP now owns the context
 }
 
 core::ConnectionContextPtr HttpServer::CreateConnection(SOCKET socket, bool isHttps) {
@@ -601,13 +656,11 @@ core::ConnectionContextPtr HttpServer::CreateConnection(SOCKET socket, bool isHt
     return connection;
 }
 
-void HttpServer::CloseConnection(core::ConnectionContext* connection) {
-    if (connection) {
-        connection->Close();
-    }
-}
-
 void HttpServer::RemoveConnection(SOCKET socket) {
+    if (socket == INVALID_SOCKET) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(m_connectionsMutex);
     auto it = m_connections.find(socket);
     if (it != m_connections.end()) {

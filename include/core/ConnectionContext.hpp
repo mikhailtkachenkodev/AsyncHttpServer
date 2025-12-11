@@ -41,24 +41,24 @@ public:
     ConnectionContext(const ConnectionContext&) = delete;
     ConnectionContext& operator=(const ConnectionContext&) = delete;
 
-    SOCKET GetSocket() const { return m_socket; }
+    SOCKET GetSocket() const { return m_socket.load(std::memory_order_acquire); }
     bool IsHttps() const { return m_isHttps; }
-    ConnectionState GetState() const { return m_state; }
-    void SetState(ConnectionState state) { m_state = state; }
+    ConnectionState GetState() const { return m_state.load(std::memory_order_acquire); }
+    void SetState(ConnectionState state) { m_state.store(state, std::memory_order_release); }
 
     void AppendToReceiveBuffer(const char* data, size_t length);
-    const std::string& GetReceiveBuffer() const { return m_receiveBuffer; }
+    std::string GetReceiveBuffer() const;
     void ClearReceiveBuffer();
     void ConsumeReceiveBuffer(size_t bytes);
 
     void SetSendBuffer(const std::string& data);
     void SetSendBuffer(std::string&& data);
-    const std::string& GetSendBuffer() const { return m_sendBuffer; }
-    size_t GetBytesSent() const { return m_bytesSent; }
-    void AddBytesSent(size_t bytes) { m_bytesSent += bytes; }
-    void ResetSendProgress() { m_bytesSent = 0; }
-    bool IsSendComplete() const { return m_bytesSent >= m_sendBuffer.size(); }
-    size_t GetRemainingBytes() const { return m_sendBuffer.size() - m_bytesSent; }
+    std::string GetSendBuffer() const;
+    size_t GetBytesSent() const { return m_bytesSent.load(std::memory_order_acquire); }
+    void AddBytesSent(size_t bytes) { m_bytesSent.fetch_add(bytes, std::memory_order_acq_rel); }
+    void ResetSendProgress() { m_bytesSent.store(0, std::memory_order_release); }
+    bool IsSendComplete() const;
+    size_t GetRemainingBytes() const;
 
     void IncrementPendingOperations() { ++m_pendingOperations; }
     void DecrementPendingOperations() { --m_pendingOperations; }
@@ -68,11 +68,11 @@ public:
     security::TlsConnection* GetTlsConnection() { return m_tlsConnection.get(); }
     const security::TlsConnection* GetTlsConnection() const { return m_tlsConnection.get(); }
 
-    bool IsKeepAlive() const { return m_keepAlive; }
-    void SetKeepAlive(bool keepAlive) { m_keepAlive = keepAlive; }
+    bool IsKeepAlive() const { return m_keepAlive.load(std::memory_order_acquire); }
+    void SetKeepAlive(bool keepAlive) { m_keepAlive.store(keepAlive, std::memory_order_release); }
 
     void UpdateLastActivity();
-    std::chrono::steady_clock::time_point GetLastActivity() const { return m_lastActivity; }
+    std::chrono::steady_clock::time_point GetLastActivity() const { return m_lastActivity.load(std::memory_order_acquire); }
 
     void SetRemoteAddress(const std::string& address) { m_remoteAddress = address; }
     const std::string& GetRemoteAddress() const { return m_remoteAddress; }
@@ -80,22 +80,24 @@ public:
     void Close();
 
 private:
-    SOCKET m_socket;
+    std::atomic<SOCKET> m_socket;
     bool m_isHttps;
-    ConnectionState m_state;
+    std::atomic<ConnectionState> m_state;
 
     std::string m_receiveBuffer;
     std::string m_sendBuffer;
-    size_t m_bytesSent;
+    std::atomic<size_t> m_bytesSent;
+    size_t m_sendBufferSize;  // Cached size for thread-safe access
 
     std::atomic<int> m_pendingOperations;
     std::unique_ptr<security::TlsConnection> m_tlsConnection;
 
-    bool m_keepAlive;
-    std::chrono::steady_clock::time_point m_lastActivity;
+    std::atomic<bool> m_keepAlive;
+    std::atomic<std::chrono::steady_clock::time_point> m_lastActivity;
     std::string m_remoteAddress;
 
     mutable std::mutex m_mutex;
+    mutable std::mutex m_closeMutex;  // Separate mutex for Close() to avoid deadlock
 };
 
 using ConnectionContextPtr = std::shared_ptr<ConnectionContext>;

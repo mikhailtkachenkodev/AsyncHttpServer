@@ -116,7 +116,21 @@ std::vector<char> TlsConnection::Encrypt(const char* plaintext, size_t length) {
         return {};
     }
 
-    size_t totalSize = m_streamSizes.cbHeader + length + m_streamSizes.cbTrailer;
+    // Validate message size to prevent integer overflow
+    constexpr size_t MAX_MESSAGE_SIZE = 16 * 1024 * 1024;  // 16MB max
+    if (length > MAX_MESSAGE_SIZE) {
+        utils::Logger::Error("Encrypt: message too large (" + std::to_string(length) + " bytes)");
+        return {};
+    }
+
+    // Check for integer overflow in total size calculation
+    size_t headerTrailerSize = static_cast<size_t>(m_streamSizes.cbHeader) + m_streamSizes.cbTrailer;
+    if (length > SIZE_MAX - headerTrailerSize) {
+        utils::Logger::Error("Encrypt: integer overflow in size calculation");
+        return {};
+    }
+
+    size_t totalSize = headerTrailerSize + length;
     std::vector<char> buffer(totalSize);
 
     std::memcpy(buffer.data() + m_streamSizes.cbHeader, plaintext, length);
